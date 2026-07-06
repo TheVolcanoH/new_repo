@@ -89,6 +89,94 @@ def update_record(token: str, record_id: str, fields: dict):
     resp.raise_for_status()
 
 
+def find_unprocessed_records(token: str, skip_record_id: str = None) -> list:
+    """扫描表中所有未处理的记录（有PDF但中文标题为空）"""
+    unprocessed = []
+    page_token = None
+
+    while True:
+        params = {"page_size": 50}
+        if page_token:
+            params["page_token"] = page_token
+
+        resp = requests.get(
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+
+        fields_list = data.get("fields", [])
+        record_ids = data.get("record_id_list", [])
+        records = data.get("data", [])
+
+        try:
+            pdf_idx = fields_list.index("上传文献PDF")
+        except ValueError:
+            pdf_idx = -1
+        try:
+            title_idx = fields_list.index("中文标题")
+        except ValueError:
+            title_idx = -1
+
+        for i, record_values in enumerate(records):
+            if i >= len(record_ids) or record_values is None:
+                continue
+            rid = record_ids[i]
+            if skip_record_id and rid == skip_record_id:
+                continue
+
+            has_pdf = (pdf_idx >= 0 and pdf_idx < len(record_values)
+                       and record_values[pdf_idx] and len(record_values[pdf_idx]) > 0)
+            has_title = (title_idx >= 0 and title_idx < len(record_values)
+                         and bool(record_values[title_idx]))
+
+            if has_pdf and not has_title:
+                unprocessed.append({
+                    "record_id": rid,
+                    "file_token": record_values[pdf_idx][0]["file_token"],
+                    "file_name": record_values[pdf_idx][0]["name"],
+                })
+
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token")
+
+    return unprocessed
+
+
+def process_single_record(token: str, record_id: str, file_token: str, file_name: str):
+    """处理单条记录: 下载PDF -> 提取文本 -> AI分析 -> 回填"""
+    print(f"  [process] {file_name}")
+
+    # 1. 下载
+    pdf_bytes = download_file(token, file_token)
+    print(f"  [download] {len(pdf_bytes)} bytes")
+
+    # 2. 提取文本
+    paper_text = extract_pdf_text(pdf_bytes)
+    print(f"  [extract] {len(paper_text)} chars")
+
+    # 3. AI 分析
+    field_values = {}
+    for i, (name, prompt) in enumerate(FIELD_PROMPTS.items(), 1):
+        print(f"  [AI {i}/12] {name}")
+        try:
+            result = analyze_with_deepseek(paper_text, prompt)
+            field_values[name] = result
+        except Exception as e:
+            print(f"  [warn] {name}: {e}")
+        time.sleep(0.5)
+
+    # 4. 回填
+    fields = {k: v for k, v in field_values.items() if v}
+    if fields:
+        update_record(token, record_id, fields)
+        print(f"  [done] {len(fields)} fields updated")
+
+
 def extract_pdf_text(file_bytes: bytes) -> str:
     """从 PDF 字节流提取文本"""
     import tempfile
@@ -179,37 +267,29 @@ def handle_webhook():
     if not record_id or not file_token:
         return jsonify({"success": False, "message": "Missing fields"}), 400
 
-    print(f"[webhook] {file_name} (record={record_id})")
+    print(f"[webhook] triggered by: {file_name}")
 
     def process():
         try:
             token = get_feishu_token()
 
-            # 1. 下载 PDF
-            print(f"  [download] {file_token}")
-            pdf_bytes = download_file(token, file_token)
+            # 1. 处理触发的记录
+            process_single_record(token, record_id, file_token, file_name)
 
-            # 2. 提取文本
-            print(f"  [extract] {len(pdf_bytes)} bytes")
-            paper_text = extract_pdf_text(pdf_bytes)
-            print(f"  [extract] {len(paper_text)} chars")
+            # 2. 扫描并补填之前遗漏的未处理记录
+            print(f"  [scan] checking for other unprocessed records...")
+            unprocessed = find_unprocessed_records(token, skip_record_id=record_id)
 
-            # 3. AI 分析
-            field_values = {}
-            for i, (name, prompt) in enumerate(FIELD_PROMPTS.items(), 1):
-                print(f"  [AI {i}/12] {name}")
-                try:
-                    result = analyze_with_deepseek(paper_text, prompt)
-                    field_values[name] = result
-                except Exception as e:
-                    print(f"  [warn] {name}: {e}")
-                time.sleep(0.5)
-
-            # 4. 回填
-            fields = {k: v for k, v in field_values.items() if v}
-            if fields:
-                update_record(token, record_id, fields)
-                print(f"  [done] {len(fields)} fields updated")
+            if unprocessed:
+                print(f"  [scan] found {len(unprocessed)} unprocessed records to fill")
+                for i, rec in enumerate(unprocessed, 1):
+                    print(f"  [{i}/{len(unprocessed)}] backlog: {rec['file_name']}")
+                    try:
+                        process_single_record(token, rec["record_id"], rec["file_token"], rec["file_name"])
+                    except Exception as e:
+                        print(f"  [error] backlog: {e}")
+            else:
+                print(f"  [scan] no other unprocessed records")
 
         except Exception as e:
             print(f"  [error] {e}")
